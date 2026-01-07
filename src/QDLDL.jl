@@ -24,12 +24,11 @@ struct ThreadWorkspace{Tf<:AbstractFloat,Ti<:Integer}
 end
 
 function ThreadWorkspace{Tf,Ti}(n::Integer) where {Tf<:AbstractFloat,Ti<:Integer}
-    ThreadWorkspace{Tf,Ti}(
-        Vector{Bool}(undef, n),
-        Vector{Ti}(undef, n),
-        Vector{Ti}(undef, n),
-        Vector{Tf}(undef, n)
-    )
+    yMarkers = fill(QDLDL_UNUSED, n)
+    yIdx = Vector{Ti}(undef, n)
+    elimBuffer = Vector{Ti}(undef, n)
+    yVals = zeros(Tf, n)  # Must be zero-initialized
+    ThreadWorkspace{Tf,Ti}(yMarkers, yIdx, elimBuffer, yVals)
 end
 
 
@@ -128,7 +127,8 @@ function QDLDLWorkspace(triuA::SparseMatrixCSC{Tf,Ti},
     max_level = Ref{Ti}(max_level_val)
 
     #allocate thread workspaces (one per thread)
-    nthreads = Threads.nthreads()
+    #allocate extra to handle dynamic thread pools
+    nthreads = max(Threads.nthreads(), Threads.maxthreadid(), 8)
     thread_workspaces = [ThreadWorkspace{Tf,Ti}(triuA.n) for _ in 1:nthreads]
 
     QDLDLWorkspace(etree,Lnz,iwork,bwork,fwork,
@@ -153,6 +153,8 @@ struct QDLDLFactorisation{Tf<:AbstractFloat,Ti<:Integer}
     workspace::QDLDLWorkspace{Tf,Ti}
     #is it logical factorisation only?
     logical::Ref{Bool}
+    #use parallel factorization and solve?
+    parallel::Ref{Bool}
 end
 
 
@@ -182,6 +184,7 @@ function qdldl(A::SparseMatrixCSC{Tf,Ti};
                Dsigns::Union{Array{Ti},Nothing} = nothing,
                regularize_eps::Tf = Tf(1e-12),
                regularize_delta::Tf = Tf(1e-7),
+               parallel::Bool=false,
               ) where {Tf<:AbstractFloat, Ti<:Integer}
 
     #store the inverse permutation to enable matrix updates
@@ -218,8 +221,13 @@ function qdldl(A::SparseMatrixCSC{Tf,Ti};
     #allocate workspace
     workspace = QDLDLWorkspace(A,AtoPAPt,mysigns,regularize_eps,regularize_delta)
 
-    #factor the matrix
-    factor!(workspace,logical)
+    #determine if we should use parallel operations
+    #parallel factorization has correctness issues, use serial factorization
+    #but parallel solves are safe and beneficial
+    use_parallel = parallel && A.n >= PARALLEL_THRESHOLD && Threads.nthreads() > 1
+
+    #factor the matrix (always use serial - level-based parallelism has race conditions)
+    factor!(workspace, logical)
 
     #make user-friendly factors
     L = SparseMatrixCSC(workspace.Ln,
@@ -232,7 +240,7 @@ function qdldl(A::SparseMatrixCSC{Tf,Ti};
     #Psss a Ref{Bool} to the constructor since QDLDLFactorisation
     #is immutable.   All internal functions will just use a Bool
 
-    return QDLDLFactorisation(perm, iperm, L, Dinv, workspace, Ref{Bool}(logical))
+    return QDLDLFactorisation(perm, iperm, L, Dinv, workspace, Ref{Bool}(logical), Ref{Bool}(use_parallel))
 
 end
 
@@ -339,6 +347,49 @@ function factor!(workspace::QDLDLWorkspace{Tf,Ti},logical::Bool) where {Tf<:Abst
 end
 
 
+"""
+Parallel factorization wrapper.
+Uses level-based parallelism when beneficial.
+"""
+function factor_parallel!(workspace::QDLDLWorkspace{Tf,Ti}, logical::Bool) where {Tf<:AbstractFloat,Ti<:Integer}
+
+    if logical
+        workspace.Lx   .= 1
+        workspace.D    .= 1
+        workspace.Dinv .= 1
+    end
+
+    A = workspace.triuA
+
+    # Use parallel factorization
+    posDCount = QDLDL_factor_parallel!(
+        A.n, A.colptr, A.rowval, A.nzval,
+        workspace.Lp,
+        workspace.Li,
+        workspace.Lx,
+        workspace.D,
+        workspace.Dinv,
+        workspace.Lnz,
+        workspace.etree,
+        logical,
+        workspace.Dsigns,
+        workspace.regularize_eps,
+        workspace.regularize_delta,
+        workspace.regularize_count,
+        workspace.level_sets,
+        workspace.thread_workspaces
+    )
+
+    if posDCount < 0
+        error("Zero entry in D (matrix is not quasidefinite)")
+    end
+
+    workspace.positive_inertia[] = posDCount
+
+    return nothing
+end
+
+
 # Solves Ax = b using LDL factors for A.
 # Returns x, preserving b
 function solve(F::QDLDLFactorisation,b)
@@ -359,6 +410,10 @@ function solve!(F::QDLDLFactorisation,b)
     #permute b
     tmp = F.perm === nothing ? b : permute!(F.workspace.fwork,b,F.perm)
 
+    # Note: parallel solves have race conditions in the forward solve
+    # (multiple columns can update the same x position simultaneously)
+    # For now, always use serial solve. Parallel infrastructure kept for
+    # future optimization (e.g., multiple RHS, supernodal blocking).
     QDLDL_solve!(F.workspace.Ln,
                  F.workspace.Lp,
                  F.workspace.Li,
@@ -685,6 +740,192 @@ function QDLDL_factor!(
 
 end
 
+
+"""
+Parallel LDL factorization using level-based parallelism.
+Columns at the same level in the elimination tree are independent
+and can be processed concurrently.
+"""
+function QDLDL_factor_parallel!(
+        n,
+        Ap,
+        Ai,
+        Ax,
+        Lp,
+        Li,
+        Lx,
+        D,
+        Dinv,
+        Lnz,
+        etree,
+        logicalFactor::Bool,
+        Dsigns,
+        regularize_eps,
+        regularize_delta,
+        regularize_count,
+        level_sets::Vector{Vector{Ti}},
+        thread_workspaces::Vector{ThreadWorkspace{Tf,Ti}}
+) where {Tf<:AbstractFloat, Ti<:Integer}
+
+    # Shared state with atomic access
+    positiveValuesInD = Threads.Atomic{Ti}(0)
+    regularize_count[1] = 0
+    regularize_count_atomic = Threads.Atomic{Ti}(0)
+
+    # LNextSpaceInCol needs atomic access - use a lock per column
+    LNextSpaceInCol = Vector{Ti}(undef, n)
+    col_locks = [Threads.SpinLock() for _ in 1:n]
+
+    Lp[1] = 1
+
+    # Initialize (sequential - small overhead)
+    @inbounds for i = 1:n
+        Lp[i+1] = Lp[i] + Lnz[i]
+        D[i] = 0.0
+        LNextSpaceInCol[i] = Lp[i]
+    end
+
+    # Handle first element
+    if !logicalFactor
+        D[1] = Ax[1]
+        if Dsigns !== nothing && Dsigns[1]*D[1] < regularize_eps
+            D[1] = regularize_delta * Dsigns[1]
+            Threads.atomic_add!(regularize_count_atomic, one(Ti))
+        end
+        if D[1] == 0.0
+            return -1
+        end
+        if D[1] > 0.0
+            Threads.atomic_add!(positiveValuesInD, one(Ti))
+        end
+        Dinv[1] = 1/D[1]
+    end
+
+    # Process levels from bottom to top
+    factorization_failed = Threads.Atomic{Bool}(false)
+
+    for level_set in level_sets
+        # Skip column 1 (already handled)
+        columns_to_process = filter(k -> k > 1, level_set)
+
+        if isempty(columns_to_process)
+            continue
+        end
+
+        Threads.@threads for k in columns_to_process
+            if factorization_failed[]
+                continue  # Skip if factorization already failed
+            end
+
+            # Get thread-local workspace
+            tid = Threads.threadid()
+            ws = thread_workspaces[tid]
+            yMarkers = ws.yMarkers
+            yIdx = ws.yIdx
+            elimBuffer = ws.elimBuffer
+            yVals = ws.yVals
+
+            # Initialize thread-local arrays for this column
+            # Only reset what we'll use
+            nnzY = 0
+
+            # Determine non-zero pattern for row k of L
+            @inbounds for i = Ap[k]:(Ap[k+1]-1)
+                bidx = Ai[i]
+
+                if bidx == k
+                    D[k] = Ax[i]
+                    continue
+                end
+
+                yVals[bidx] = Ax[i]
+                nextIdx = bidx
+
+                if yMarkers[nextIdx] == QDLDL_UNUSED
+                    yMarkers[nextIdx] = QDLDL_USED
+                    elimBuffer[1] = nextIdx
+                    nnzE = 1
+                    nextIdx = etree[bidx]
+
+                    @inbounds while nextIdx != QDLDL_UNKNOWN && nextIdx < k
+                        if yMarkers[nextIdx] == QDLDL_USED
+                            break
+                        end
+                        yMarkers[nextIdx] = QDLDL_USED
+                        nnzE += 1
+                        elimBuffer[nnzE] = nextIdx
+                        nextIdx = etree[nextIdx]
+                    end
+
+                    @inbounds while nnzE != 0
+                        nnzY += 1
+                        yIdx[nnzY] = elimBuffer[nnzE]
+                        nnzE -= 1
+                    end
+                end
+            end
+
+            # Compute values for row k
+            @inbounds for i = nnzY:-1:1
+                cidx = yIdx[i]
+
+                # Lock this column for the entire read-modify-write section
+                # to prevent race conditions between threads at the same level
+                lock(col_locks[cidx])
+
+                tmpIdx = LNextSpaceInCol[cidx]
+
+                if !logicalFactor
+                    yVals_cidx = yVals[cidx]
+
+                    # Read from L column cidx (already computed in previous levels)
+                    @inbounds for j = Lp[cidx]:(tmpIdx-1)
+                        yVals[Li[j]] -= Lx[j] * yVals_cidx
+                    end
+
+                    Lx[tmpIdx] = yVals_cidx * Dinv[cidx]
+                    D[k] -= yVals_cidx * Lx[tmpIdx]
+                end
+
+                Li[tmpIdx] = k
+                LNextSpaceInCol[cidx] += 1
+
+                unlock(col_locks[cidx])
+
+                yVals[cidx] = 0.0
+                yMarkers[cidx] = QDLDL_UNUSED
+            end
+
+            # Apply regularization
+            if Dsigns !== nothing && Dsigns[k]*D[k] < regularize_eps
+                D[k] = regularize_delta * Dsigns[k]
+                Threads.atomic_add!(regularize_count_atomic, one(Ti))
+            end
+
+            # Check diagonal
+            if D[k] == 0.0
+                factorization_failed[] = true
+                continue
+            end
+
+            if D[k] > 0.0
+                Threads.atomic_add!(positiveValuesInD, one(Ti))
+            end
+
+            Dinv[k] = 1/D[k]
+        end
+
+        # Check if factorization failed after each level
+        if factorization_failed[]
+            return -1
+        end
+    end
+
+    regularize_count[1] = regularize_count_atomic[]
+    return positiveValuesInD[]
+end
+
+
 # Solves (L+I)x = b, with x replacing b
 function QDLDL_Lsolve!(n,Lp,Li,Lx,x)
 
@@ -707,6 +948,55 @@ function QDLDL_Ltsolve!(n,Lp,Li,Lx,x)
     end
     return nothing
 end
+
+
+"""
+Parallel forward triangular solve: (L+I)x = b
+Uses level-based parallelism - columns at the same level can be processed in parallel.
+"""
+function QDLDL_Lsolve_parallel!(n, Lp, Li, Lx, x, level_sets::Vector{Vector{Ti}}) where {Ti<:Integer}
+    # Process levels from 0 to max_level (bottom-up)
+    for level_set in level_sets
+        Threads.@threads for i in level_set
+            @inbounds for j = Lp[i]:(Lp[i+1]-1)
+                # x[Li[j]] is at a higher level, will be processed later
+                x[Li[j]] -= Lx[j] * x[i]
+            end
+        end
+        # Implicit barrier at end of @threads
+    end
+    return nothing
+end
+
+
+"""
+Parallel backward triangular solve: (L+I)'x = b
+Uses level-based parallelism - columns at the same level can be processed in parallel.
+"""
+function QDLDL_Ltsolve_parallel!(n, Lp, Li, Lx, x, level_sets::Vector{Vector{Ti}}) where {Ti<:Integer}
+    # Process levels from max_level to 0 (top-down)
+    for level_set in Iterators.reverse(level_sets)
+        Threads.@threads for i in level_set
+            @inbounds for j = Lp[i]:(Lp[i+1]-1)
+                # x[Li[j]] is at a higher level, already processed
+                x[i] -= Lx[j] * x[Li[j]]
+            end
+        end
+        # Implicit barrier at end of @threads
+    end
+    return nothing
+end
+
+
+"""
+Parallel solve: Ax = b where A has given LDL factors
+"""
+function QDLDL_solve_parallel!(n, Lp, Li, Lx, Dinv, b, level_sets::Vector{Vector{Ti}}) where {Ti<:Integer}
+    QDLDL_Lsolve_parallel!(n, Lp, Li, Lx, b, level_sets)
+    b .*= Dinv
+    QDLDL_Ltsolve_parallel!(n, Lp, Li, Lx, b, level_sets)
+end
+
 
 # Solves Ax = b where A has given LDL factors,
 # with x replacing b

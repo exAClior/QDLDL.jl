@@ -17,6 +17,7 @@ end
   include("./UnitTests/inertia.jl")
   include("./UnitTests/regularization.jl")
   include("./UnitTests/update_values.jl")
+  include("./UnitTests/parallel.jl")
 
 end
 nothing
