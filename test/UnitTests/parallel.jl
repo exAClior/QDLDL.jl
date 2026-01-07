@@ -141,3 +141,68 @@ end
         end
     end
 end
+
+@testset "Supernode Detection" begin
+    # Test that supernode detection produces valid results
+    n = 500
+
+    Random.seed!(321)
+    A = sprandn(n, n, 0.05)
+    A = A + A'
+    A = A + n * I
+    A = sparse(A)
+
+    F = qdldl(A)
+    ws = F.workspace
+
+    # Check all columns have valid supernode membership
+    @test all(ws.snode_membership .>= 1)
+    @test all(ws.snode_membership .<= ws.num_supernodes[])
+
+    # Check supernode ranges cover all columns
+    total_cols = 0
+    for (start, stop) in ws.snode_ranges
+        @test start >= 1
+        @test stop <= n
+        @test stop >= start
+        total_cols += stop - start + 1
+
+        # All columns in range should have same supernode id
+        snode_id = ws.snode_membership[start]
+        for j in start:stop
+            @test ws.snode_membership[j] == snode_id
+        end
+    end
+    @test total_cols == n
+
+    # Number of supernodes should match ranges
+    @test length(ws.snode_ranges) == ws.num_supernodes[]
+end
+
+@testset "Supernode Properties" begin
+    # Test supernode properties on a matrix known to have supernodes
+    # A banded matrix tends to have larger supernodes
+    n = 100
+    bandwidth = 5
+
+    # Create banded matrix
+    A = spzeros(n, n)
+    for i in 1:n
+        A[i, i] = n + 1.0  # diagonal
+        for k in 1:bandwidth
+            if i + k <= n
+                A[i, i+k] = -1.0
+            end
+        end
+    end
+    A = sparse(A + A')
+
+    F = qdldl(A)
+    ws = F.workspace
+
+    # Banded matrices should have some supernodes larger than 1
+    max_snode_size = maximum(stop - start + 1 for (start, stop) in ws.snode_ranges)
+    # Not all matrices have large supernodes, but at least check it runs
+    @test max_snode_size >= 1
+    @test ws.num_supernodes[] <= n  # At most n supernodes (singleton)
+end

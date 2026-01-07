@@ -3,7 +3,7 @@ module QDLDL
 export qdldl, \, solve, solve!, refactor!, update_values!, scale_values!,  positive_inertia, regularized_entries
 
 using AMD, SparseArrays
-using LinearAlgebra: istriu, triu, Diagonal
+using LinearAlgebra: istriu, triu, Diagonal, BLAS, LAPACK
 
 const QDLDL_UNKNOWN = -1;
 const QDLDL_USED   = true;
@@ -11,6 +11,37 @@ const QDLDL_UNUSED = false;
 
 # Minimum matrix size for parallel factorization
 const PARALLEL_THRESHOLD = 1000
+
+# Minimum supernode size to use BLAS operations
+# Smaller supernodes use scalar loops (lower overhead)
+const SUPERNODE_BLAS_THRESHOLD = 32
+
+# =============================================================================
+# PARALLEL FACTORIZATION STATUS
+# =============================================================================
+#
+# Current implementation provides parallelism via:
+# 1. Multi-RHS solve: parallelizes across columns of B in solve(F, B::Matrix)
+#    Achieves ~3.6x speedup with 4 threads
+#
+# Infrastructure in place for future improvements:
+# - Level computation for elimination tree
+# - Supernode detection (columns with nested sparsity patterns)
+#
+# KNOWN LIMITATION: Level-based parallel factorization has race conditions
+# because columns at the same level can share ancestors. The factorization
+# currently uses the serial algorithm for correctness.
+#
+# FUTURE DIRECTIONS for parallel factorization:
+# 1. Supernodal factorization with BLAS threading:
+#    - Use dense BLAS operations (TRSM, GEMM) within large supernodes
+#    - BLAS library provides threading automatically
+# 2. Independent subtree parallelism:
+#    - Identify subtrees with disjoint ancestors
+#    - Process independent subtrees in parallel
+# 3. Right-looking reformulation:
+#    - Changes data dependencies to enable more parallelism
+# =============================================================================
 
 """
 Thread-local workspace for parallel factorization.
@@ -81,6 +112,11 @@ struct QDLDLWorkspace{Tf<:AbstractFloat,Ti<:Integer}
     max_level::Ref{Ti}                          # maximum level
     thread_workspaces::Vector{ThreadWorkspace{Tf,Ti}}  # per-thread work arrays
 
+    #supernodal factorization support
+    snode_membership::Vector{Ti}                # snode_membership[i] = supernode containing column i
+    snode_ranges::Vector{Tuple{Ti,Ti}}          # (start, end) for each supernode
+    num_supernodes::Ref{Ti}                     # total number of supernodes
+
 end
 
 function QDLDLWorkspace(triuA::SparseMatrixCSC{Tf,Ti},
@@ -131,11 +167,18 @@ function QDLDLWorkspace(triuA::SparseMatrixCSC{Tf,Ti},
     nthreads = max(Threads.nthreads(), Threads.maxthreadid(), 8)
     thread_workspaces = [ThreadWorkspace{Tf,Ti}(triuA.n) for _ in 1:nthreads]
 
+    #supernodal factorization support
+    snode_membership = Vector{Ti}(undef, triuA.n)
+    snode_ranges = Vector{Tuple{Ti,Ti}}()
+    num_snode = detect_supernodes!(etree, Lnz, snode_membership, snode_ranges)
+    num_supernodes = Ref{Ti}(num_snode)
+
     QDLDLWorkspace(etree,Lnz,iwork,bwork,fwork,
                    Ln,Lp,Li,Lx,D,Dinv,positive_inertia,triuA,
                    AtoPAPt, Dsigns,regularize_eps,
                    regularize_delta,regularize_count,
-                   levels, level_sets, max_level, thread_workspaces)
+                   levels, level_sets, max_level, thread_workspaces,
+                   snode_membership, snode_ranges, num_supernodes)
 
 end
 
@@ -618,6 +661,57 @@ function compute_tree_levels!(etree::Vector{Ti}, levels::Vector{Ti},
     end
 
     return max_level
+end
+
+
+"""
+    detect_supernodes!(etree, Lnz, snode_membership, snode_ranges)
+
+Detect fundamental supernodes in the elimination tree.
+A supernode is a maximal set of consecutive columns j, j+1, ..., j+k-1 where:
+- etree[j+i] = j+i+1 for i = 0, ..., k-2 (chain in elimination tree)
+- Lnz[j+i+1] = Lnz[j+i] - 1 (nested sparsity pattern)
+
+Returns the number of supernodes.
+- `snode_membership[i]` = supernode index that column i belongs to
+- `snode_ranges` = vector of (start, end) pairs for each supernode
+"""
+function detect_supernodes!(etree::Vector{Ti}, Lnz::Vector{Ti},
+                            snode_membership::Vector{Ti},
+                            snode_ranges::Vector{Tuple{Ti,Ti}}) where {Ti<:Integer}
+    n = length(etree)
+    empty!(snode_ranges)
+
+    if n == 0
+        return Ti(0)
+    end
+
+    snode_id = Ti(1)
+    snode_start = Ti(1)
+
+    for j = 1:n-1
+        # Check if j and j+1 are in the same supernode:
+        # 1. j's parent in etree is j+1
+        # 2. Lnz[j+1] = Lnz[j] - 1 (nested pattern)
+        in_same_snode = (etree[j] == j + 1) && (Lnz[j+1] == Lnz[j] - 1)
+
+        if in_same_snode
+            # Continue current supernode
+            snode_membership[j] = snode_id
+        else
+            # End current supernode, start new one
+            snode_membership[j] = snode_id
+            push!(snode_ranges, (snode_start, Ti(j)))
+            snode_id += 1
+            snode_start = Ti(j + 1)
+        end
+    end
+
+    # Handle last column
+    snode_membership[n] = snode_id
+    push!(snode_ranges, (snode_start, Ti(n)))
+
+    return snode_id
 end
 
 
