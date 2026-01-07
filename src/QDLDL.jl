@@ -9,6 +9,29 @@ const QDLDL_UNKNOWN = -1;
 const QDLDL_USED   = true;
 const QDLDL_UNUSED = false;
 
+# Minimum matrix size for parallel factorization
+const PARALLEL_THRESHOLD = 1000
+
+"""
+Thread-local workspace for parallel factorization.
+Each thread gets its own copy to avoid data races.
+"""
+struct ThreadWorkspace{Tf<:AbstractFloat,Ti<:Integer}
+    yMarkers::Vector{Bool}
+    yIdx::Vector{Ti}
+    elimBuffer::Vector{Ti}
+    yVals::Vector{Tf}
+end
+
+function ThreadWorkspace{Tf,Ti}(n::Integer) where {Tf<:AbstractFloat,Ti<:Integer}
+    ThreadWorkspace{Tf,Ti}(
+        Vector{Bool}(undef, n),
+        Vector{Ti}(undef, n),
+        Vector{Ti}(undef, n),
+        Vector{Tf}(undef, n)
+    )
+end
+
 
 struct QDLDLWorkspace{Tf<:AbstractFloat,Ti<:Integer}
 
@@ -53,6 +76,12 @@ struct QDLDLWorkspace{Tf<:AbstractFloat,Ti<:Integer}
     #while maintaining immutability
     regularize_count::Vector{Ti}
 
+    #parallel factorization support
+    levels::Vector{Ti}                          # level of each node in etree
+    level_sets::Vector{Vector{Ti}}              # nodes grouped by level
+    max_level::Ref{Ti}                          # maximum level
+    thread_workspaces::Vector{ThreadWorkspace{Tf,Ti}}  # per-thread work arrays
+
 end
 
 function QDLDLWorkspace(triuA::SparseMatrixCSC{Tf,Ti},
@@ -92,10 +121,21 @@ function QDLDLWorkspace(triuA::SparseMatrixCSC{Tf,Ti},
     #number of regularized entries in D. None to start
     regularize_count = zeros(Ti,1)
 
+    #parallel factorization support
+    levels = Vector{Ti}(undef, triuA.n)
+    level_sets = Vector{Vector{Ti}}()
+    max_level_val = compute_tree_levels!(etree, levels, level_sets)
+    max_level = Ref{Ti}(max_level_val)
+
+    #allocate thread workspaces (one per thread)
+    nthreads = Threads.nthreads()
+    thread_workspaces = [ThreadWorkspace{Tf,Ti}(triuA.n) for _ in 1:nthreads]
+
     QDLDLWorkspace(etree,Lnz,iwork,bwork,fwork,
                    Ln,Lp,Li,Lx,D,Dinv,positive_inertia,triuA,
                    AtoPAPt, Dsigns,regularize_eps,
-                   regularize_delta,regularize_count)
+                   regularize_delta,regularize_count,
+                   levels, level_sets, max_level, thread_workspaces)
 
 end
 
@@ -377,6 +417,81 @@ function QDLDL_etree!(n,Ap,Ai,work,Lnz,etree)
 end
 
 
+"""
+    compute_tree_levels!(etree, levels, level_sets)
+
+Compute levels in the elimination tree for parallel factorization.
+Nodes at the same level are independent and can be processed in parallel.
+
+- `etree`: elimination tree (etree[i] = parent of i, or QDLDL_UNKNOWN for root)
+- `levels`: output vector, levels[i] = level of node i (leaves = 0)
+- `level_sets`: output vector of vectors, level_sets[l+1] contains nodes at level l
+
+Returns the maximum level.
+"""
+function compute_tree_levels!(etree::Vector{Ti}, levels::Vector{Ti},
+                              level_sets::Vector{Vector{Ti}}) where {Ti<:Integer}
+    n = length(etree)
+
+    # Initialize levels to -1 (uncomputed)
+    fill!(levels, Ti(-1))
+
+    # Count children for each node
+    child_count = zeros(Ti, n)
+    for i = 1:n
+        parent = etree[i]
+        if parent != QDLDL_UNKNOWN && parent <= n
+            child_count[parent] += 1
+        end
+    end
+
+    # Leaves have no children, assign level 0
+    # Use a queue-based approach (bottom-up)
+    queue = Ti[]
+    for i = 1:n
+        if child_count[i] == 0
+            levels[i] = 0
+            push!(queue, i)
+        end
+    end
+
+    # Process nodes bottom-up
+    max_level = Ti(0)
+    while !isempty(queue)
+        node = popfirst!(queue)
+        parent = etree[node]
+
+        if parent != QDLDL_UNKNOWN && parent <= n
+            # Parent's level is max of children's levels + 1
+            new_level = levels[node] + 1
+            if levels[parent] < new_level
+                levels[parent] = new_level
+                max_level = max(max_level, new_level)
+            end
+
+            # Decrement parent's remaining children count
+            child_count[parent] -= 1
+            if child_count[parent] == 0
+                push!(queue, parent)
+            end
+        end
+    end
+
+    # Build level sets
+    empty!(level_sets)
+    for _ = 0:max_level
+        push!(level_sets, Ti[])
+    end
+
+    for i = 1:n
+        level = levels[i]
+        if level >= 0
+            push!(level_sets[level + 1], i)  # +1 for 1-based indexing
+        end
+    end
+
+    return max_level
+end
 
 
 function QDLDL_factor!(
