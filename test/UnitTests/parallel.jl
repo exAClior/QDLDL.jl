@@ -83,6 +83,34 @@ end
     end
 end
 
+@testset "Multi-RHS Parallel Solve" begin
+    # Test parallel solve across multiple right-hand sides
+    n = 1200
+
+    Random.seed!(999)
+    A = sprandn(n, n, 0.02)
+    A = A + A'
+    A = A + n * I
+    A = sparse(A)
+
+    F = qdldl(A, parallel=true)
+
+    # Multiple right-hand sides
+    nrhs = 10
+    B = randn(n, nrhs)
+
+    X = solve(F, B)
+
+    # Check all solutions are correct
+    @test norm(A * X - B) < 1e-8 * norm(B)
+
+    # Compare with serial
+    F_serial = qdldl(A, parallel=false)
+    X_serial = solve(F_serial, B)
+
+    @test X ≈ X_serial rtol=1e-10
+end
+
 @testset "Level Computation" begin
     # Test that level computation produces valid levels
     n = 500

@@ -391,16 +391,92 @@ end
 
 
 # Solves Ax = b using LDL factors for A.
-# Returns x, preserving b
-function solve(F::QDLDLFactorisation,b)
+# Returns x, preserving b (single RHS as vector)
+function solve(F::QDLDLFactorisation, b::AbstractVector)
     x = copy(b)
-    solve!(F,x)
+    solve!(F, x)
     return x
 end
 
+
+"""
+    solve(F, B::AbstractMatrix)
+
+Solve AX = B for multiple right-hand sides.
+When parallel=true was used in factorization and nthreads > 1,
+solves are parallelized across columns of B.
+"""
+function solve(F::QDLDLFactorisation{Tf,Ti}, B::AbstractMatrix{Tf}) where {Tf,Ti}
+    X = copy(B)
+    solve!(F, X)
+    return X
+end
+
+
+"""
+    solve!(F, B::AbstractMatrix)
+
+Solve AX = B in-place for multiple right-hand sides.
+When parallel=true was used in factorization and nthreads > 1,
+solves are parallelized across columns of B.
+"""
+function solve!(F::QDLDLFactorisation{Tf,Ti}, B::AbstractMatrix{Tf}) where {Tf,Ti}
+
+    if F.logical[]
+        error("Can't solve with logical factorisation only")
+    end
+
+    nrhs = size(B, 2)
+
+    # Parallelize across right-hand sides when beneficial
+    if F.parallel[] && nrhs > 1 && Threads.nthreads() > 1
+        Threads.@threads for j in 1:nrhs
+            b_col = view(B, :, j)
+            _solve_single_rhs!(F, b_col)
+        end
+    else
+        for j in 1:nrhs
+            b_col = view(B, :, j)
+            _solve_single_rhs!(F, b_col)
+        end
+    end
+
+    return nothing
+end
+
+
+# Internal: solve for a single RHS (used by parallel multi-RHS solver)
+function _solve_single_rhs!(F::QDLDLFactorisation{Tf,Ti}, b::AbstractVector{Tf}) where {Tf,Ti}
+    n = F.workspace.Ln
+
+    # Need thread-local work array for permutation
+    if F.perm !== nothing
+        tmp = similar(b)
+        permute!(tmp, b, F.perm)
+
+        QDLDL_solve!(n,
+                     F.workspace.Lp,
+                     F.workspace.Li,
+                     F.workspace.Lx,
+                     F.workspace.Dinv,
+                     tmp)
+
+        ipermute!(b, tmp, F.perm)
+    else
+        QDLDL_solve!(n,
+                     F.workspace.Lp,
+                     F.workspace.Li,
+                     F.workspace.Lx,
+                     F.workspace.Dinv,
+                     b)
+    end
+
+    return nothing
+end
+
 # Solves Ax = b using LDL factors for A.
-# Solves in place (x replaces b)
-function solve!(F::QDLDLFactorisation,b)
+# Solves in place (x replaces b) - single RHS as vector
+function solve!(F::QDLDLFactorisation, b::AbstractVector)
 
     #bomb if logical factorisation only
     if F.logical[]
@@ -408,12 +484,8 @@ function solve!(F::QDLDLFactorisation,b)
     end
 
     #permute b
-    tmp = F.perm === nothing ? b : permute!(F.workspace.fwork,b,F.perm)
+    tmp = F.perm === nothing ? b : permute!(F.workspace.fwork, b, F.perm)
 
-    # Note: parallel solves have race conditions in the forward solve
-    # (multiple columns can update the same x position simultaneously)
-    # For now, always use serial solve. Parallel infrastructure kept for
-    # future optimization (e.g., multiple RHS, supernodal blocking).
     QDLDL_solve!(F.workspace.Ln,
                  F.workspace.Lp,
                  F.workspace.Li,
@@ -422,7 +494,7 @@ function solve!(F::QDLDLFactorisation,b)
                  tmp)
 
     #inverse permutation
-    b = F.perm === nothing ? tmp : ipermute!(b,F.workspace.fwork,F.perm)
+    b = F.perm === nothing ? tmp : ipermute!(b, F.workspace.fwork, F.perm)
 
     return nothing
 end
