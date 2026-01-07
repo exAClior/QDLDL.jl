@@ -206,3 +206,97 @@ end
     @test max_snode_size >= 1
     @test ws.num_supernodes[] <= n  # At most n supernodes (singleton)
 end
+
+@testset "Children List and Subtree Sizes" begin
+    # Test children list and subtree size computation
+    n = 500
+
+    Random.seed!(555)
+    A = sprandn(n, n, 0.03)
+    A = A + A'
+    A = A + n * I
+    A = sparse(A)
+
+    F = qdldl(A)
+    ws = F.workspace
+
+    # Verify children list is inverse of etree
+    for i in 1:n
+        for child in ws.children[i]
+            @test ws.etree[child] == i
+        end
+    end
+
+    # Verify all non-root nodes appear as a child exactly once
+    child_count = zeros(Int, n)
+    for i in 1:n
+        for child in ws.children[i]
+            child_count[child] += 1
+        end
+    end
+    for i in 1:n
+        parent = ws.etree[i]
+        if parent != -1 && parent <= n
+            @test child_count[i] == 1
+        else
+            @test child_count[i] == 0  # Root has no parent, not listed as child
+        end
+    end
+
+    # Verify subtree sizes
+    @test all(ws.subtree_sizes .>= 1)  # Every node is at least size 1
+
+    # Subtree size of node = 1 + sum of children's subtree sizes
+    for i in 1:n
+        expected_size = 1
+        for child in ws.children[i]
+            expected_size += ws.subtree_sizes[child]
+        end
+        @test ws.subtree_sizes[i] == expected_size
+    end
+
+    # Root(s) should have largest subtree sizes
+    roots = findall(i -> ws.etree[i] == -1 || ws.etree[i] > n, 1:n)
+    if !isempty(roots)
+        root_sizes = [ws.subtree_sizes[r] for r in roots]
+        @test sum(root_sizes) == n  # All nodes belong to some root's subtree
+    end
+end
+
+@testset "Tree Structure Consistency" begin
+    # Verify etree, levels, children, and subtree_sizes are all consistent
+    n = 200
+
+    Random.seed!(777)
+    A = sprandn(n, n, 0.05)
+    A = A + A'
+    A = A + n * I
+    A = sparse(A)
+
+    F = qdldl(A)
+    ws = F.workspace
+
+    # Leaves should have no children and level 0
+    for i in 1:n
+        if isempty(ws.children[i])
+            @test ws.levels[i] == 0
+            @test ws.subtree_sizes[i] == 1
+        end
+    end
+
+    # Parent level should be > child level
+    for i in 1:n
+        parent = ws.etree[i]
+        if parent != -1 && parent <= n
+            @test ws.levels[parent] > ws.levels[i]
+        end
+    end
+
+    # Level should be max(children levels) + 1
+    for i in 1:n
+        if !isempty(ws.children[i])
+            max_child_level = maximum(ws.levels[c] for c in ws.children[i])
+            @test ws.levels[i] == max_child_level + 1
+        end
+    end
+end

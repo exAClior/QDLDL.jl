@@ -24,23 +24,38 @@ const SUPERNODE_BLAS_THRESHOLD = 32
 # 1. Multi-RHS solve: parallelizes across columns of B in solve(F, B::Matrix)
 #    Achieves ~3.6x speedup with 4 threads
 #
-# Infrastructure in place for future improvements:
-# - Level computation for elimination tree
-# - Supernode detection (columns with nested sparsity patterns)
+# Infrastructure in place for future parallel factorization:
+# - Level computation for elimination tree (levels, level_sets)
+# - Supernode detection (snode_membership, snode_ranges)
+# - Children list (inverse of etree) for task-based traversal
+# - Subtree sizes for load balancing decisions
 #
-# KNOWN LIMITATION: Level-based parallel factorization has race conditions
-# because columns at the same level can share ancestors. The factorization
-# currently uses the serial algorithm for correctness.
+# WHY PARALLEL FACTORIZATION IS HARD FOR LEFT-LOOKING LDL:
+# The left-looking algorithm processes columns 1..n in order. Column k reads
+# from columns j < k that are in its "reach" (determined by elimination tree
+# paths from nonzeros in A[:,k]). The key challenge:
 #
-# FUTURE DIRECTIONS for parallel factorization:
+# 1. Level-based parallelism (attempted): Columns at the same etree level
+#    can share ancestors through the sparsity pattern, creating race conditions.
+#
+# 2. Sibling parallelism: Even etree siblings can have dependencies if their
+#    column ranges interleave (the AMD ordering doesn't guarantee separation).
+#
+# 3. Task-based parallelism: Would require either:
+#    a) Nested dissection ordering (not AMD) to guarantee subtree separation
+#    b) Complex dependency analysis of the filled graph
+#    c) Right-looking reformulation (different algorithm)
+#
+# FUTURE DIRECTIONS:
 # 1. Supernodal factorization with BLAS threading:
 #    - Use dense BLAS operations (TRSM, GEMM) within large supernodes
 #    - BLAS library provides threading automatically
-# 2. Independent subtree parallelism:
-#    - Identify subtrees with disjoint ancestors
-#    - Process independent subtrees in parallel
+# 2. Nested dissection ordering option:
+#    - Reorder matrix to enable subtree parallelism
+#    - Trade-off: may increase fill-in vs AMD
 # 3. Right-looking reformulation:
-#    - Changes data dependencies to enable more parallelism
+#    - After processing column k, push updates to dependent columns
+#    - Allows multiple columns to accumulate updates in parallel
 # =============================================================================
 
 """
@@ -117,6 +132,10 @@ struct QDLDLWorkspace{Tf<:AbstractFloat,Ti<:Integer}
     snode_ranges::Vector{Tuple{Ti,Ti}}          # (start, end) for each supernode
     num_supernodes::Ref{Ti}                     # total number of supernodes
 
+    #task-based parallelism support
+    children::Vector{Vector{Ti}}                # children[i] = list of children of node i in etree
+    subtree_sizes::Vector{Ti}                   # subtree_sizes[i] = size of subtree rooted at i
+
 end
 
 function QDLDLWorkspace(triuA::SparseMatrixCSC{Tf,Ti},
@@ -173,12 +192,18 @@ function QDLDLWorkspace(triuA::SparseMatrixCSC{Tf,Ti},
     num_snode = detect_supernodes!(etree, Lnz, snode_membership, snode_ranges)
     num_supernodes = Ref{Ti}(num_snode)
 
+    #task-based parallelism support
+    children = build_children_list(etree)
+    subtree_sizes = Vector{Ti}(undef, triuA.n)
+    compute_subtree_sizes!(etree, children, subtree_sizes)
+
     QDLDLWorkspace(etree,Lnz,iwork,bwork,fwork,
                    Ln,Lp,Li,Lx,D,Dinv,positive_inertia,triuA,
                    AtoPAPt, Dsigns,regularize_eps,
                    regularize_delta,regularize_count,
                    levels, level_sets, max_level, thread_workspaces,
-                   snode_membership, snode_ranges, num_supernodes)
+                   snode_membership, snode_ranges, num_supernodes,
+                   children, subtree_sizes)
 
 end
 
@@ -661,6 +686,79 @@ function compute_tree_levels!(etree::Vector{Ti}, levels::Vector{Ti},
     end
 
     return max_level
+end
+
+
+"""
+    build_children_list(etree)
+
+Build a list of children for each node in the elimination tree.
+Returns a vector of vectors where children[i] contains the indices of all children of node i.
+"""
+function build_children_list(etree::Vector{Ti}) where {Ti<:Integer}
+    n = length(etree)
+    children = [Ti[] for _ in 1:n]
+
+    for i = 1:n
+        parent = etree[i]
+        if parent != QDLDL_UNKNOWN && parent <= n
+            push!(children[parent], i)
+        end
+    end
+
+    return children
+end
+
+
+"""
+    compute_subtree_sizes!(etree, children, subtree_sizes)
+
+Compute the size of each subtree in the elimination tree.
+subtree_sizes[i] = number of nodes in the subtree rooted at i (including i).
+"""
+function compute_subtree_sizes!(etree::Vector{Ti}, children::Vector{Vector{Ti}},
+                                subtree_sizes::Vector{Ti}) where {Ti<:Integer}
+    n = length(etree)
+    fill!(subtree_sizes, Ti(0))
+
+    # Process in reverse order (leaves first, then parents)
+    for i = 1:n
+        subtree_sizes[i] = 1  # Count self
+        for child in children[i]
+            subtree_sizes[i] += subtree_sizes[child]
+        end
+    end
+
+    return nothing
+end
+
+
+"""
+    find_parallel_subtrees(etree, children, subtree_sizes, min_size)
+
+Find subtrees that are suitable for parallel processing.
+Returns indices of nodes whose subtrees:
+1. Are large enough (>= min_size)
+2. Are children of the same parent (siblings can be processed in parallel in post-order)
+
+Note: For left-looking LDL, siblings can only be processed in parallel if their
+column ranges don't overlap and they don't share dependencies. This function
+identifies candidates; actual parallelism requires careful dependency analysis.
+"""
+function find_parallel_subtrees(etree::Vector{Ti}, children::Vector{Vector{Ti}},
+                                subtree_sizes::Vector{Ti}, min_size::Ti) where {Ti<:Integer}
+    n = length(etree)
+    parallel_roots = Ti[]
+
+    # Find nodes with multiple large children
+    for i = 1:n
+        large_children = filter(c -> subtree_sizes[c] >= min_size, children[i])
+        if length(large_children) >= 2
+            append!(parallel_roots, large_children)
+        end
+    end
+
+    return parallel_roots
 end
 
 
