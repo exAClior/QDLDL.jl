@@ -92,7 +92,8 @@ function run_benchmarks()
     println("-" ^ 70)
     println("FACTORIZATION BENCHMARK")
     println("-" ^ 70)
-    println("Note: Parallel factorization currently falls back to serial")
+    println("Note: Parallel factorization has high sync overhead for sparse matrices.")
+    println("      Uses heuristic: only parallel if avg cols/level > 100")
     println()
 
     for n in sizes
